@@ -329,12 +329,13 @@ async fn trickle_in(
     info!("Received Trickle Ice Candidate: {:?}", body.ice_candidate);
     // This code is repeated in all http endpoints but only commented here
 
-    // Lock the connections HashMap for reading
-    let connections = state.connections.read().await;
-    // get the Option<Arc<StoredConnection>> and clone Option & Arc
-    let maybe_connection = connections.get(connection_id.as_ref()).cloned();
-    // release the read-lock to that parallel start-requests can acquire the write-lock to add new connections
-    drop(connections);
+    let maybe_connection = {
+        // Lock the connections HashMap for reading
+        let connections = state.connections.read().await;
+        // get the Option<Arc<StoredConnection>> and clone Option & Arc
+        connections.get(connection_id.as_ref()).cloned()
+        // release the read-lock to that parallel start-requests can acquire the write-lock to add new connections
+    };
 
     // at this point the Option and the Arc are cloned, which means that we can continue to use both
     // for the lifetime of this function and the StoredConnection will not be freed in the meantime.
@@ -366,9 +367,10 @@ async fn trickle_out(
     state: web::Data<AppState>,
 ) -> Result<HttpResponse, Box<dyn std::error::Error>> {
     info!("Received Long-Poll Request for Remote Trickle Ice Candidates");
-    let connections = state.connections.read().await;
-    let maybe_connection = connections.get(connection_id.as_ref()).cloned();
-    drop(connections);
+    let maybe_connection = {
+        let connections = state.connections.read().await;
+        connections.get(connection_id.as_ref()).cloned()
+    };
 
     match maybe_connection {
         Some(connection) => {
@@ -415,9 +417,10 @@ async fn stop(
     connection_id: web::Path<Uuid>,
     state: web::Data<AppState>,
 ) -> Result<HttpResponse, Box<dyn std::error::Error>> {
-    let connections = state.connections.read().await;
-    let maybe_connection = connections.get(connection_id.as_ref()).cloned();
-    drop(connections);
+    let maybe_connection = {
+        let connections = state.connections.read().await;
+        connections.get(connection_id.as_ref()).cloned()
+    };
 
     match maybe_connection {
         Some(connection) => {
