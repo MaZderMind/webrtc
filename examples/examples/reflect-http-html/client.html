@@ -12,9 +12,32 @@
 
 <script type="application/javascript">
     let audioEl, pc, connectionId;
+    let remoteReachable = Promise.resolve()
 
     const base = window.location.href;
+
+    async function delay(n) {
+        return new Promise(resolve => {
+            setTimeout(() => resolve(), n)
+        })
+    }
+
+    async function waitForRemoteReachable() {
+        const num_retries = 240 /* 60s / 250ms */
+        for (let i = 0; i < num_retries; i++) {
+            try {
+                return await fetch(`${base}ping`, {
+                    signal: AbortSignal.timeout(500),
+                })
+            }
+            catch (e) {
+                await delay(250)
+            }
+        }
+    }
+
     async function post(path, body) {
+        await remoteReachable
         return await fetch(`${base}${path}`, {
             method: 'POST',
             headers: {
@@ -26,6 +49,7 @@
     }
 
     async function get(path) {
+        await remoteReachable
         return await fetch(`${base}${path}`, {
             headers: {
                 'Accept': 'application/json',
@@ -47,10 +71,11 @@
 
         pc = new RTCPeerConnection(configuration);
 
-        pc.addEventListener("icecandidate", (ev) => onLocalIceCandidateEvent(ev));
-        pc.addEventListener("track", (ev) => onTrackEvent(ev));
-        pc.addEventListener("connectionstatechange", () => onStateChangeEvent());
-        pc.addEventListener("signalingstatechange", () => onStateChangeEvent());
+        pc.addEventListener("icecandidate", (ev) => onLocalIceCandidateEvent(ev))
+        pc.addEventListener("track", (ev) => onTrackEvent(ev))
+        pc.addEventListener("connectionstatechange", () => onStateChangeEvent())
+        pc.addEventListener("signalingstatechange", () => onStateChangeEvent())
+        pc.addEventListener("negotiationneeded", () => onNegotiationNeeded())
 
         const localStream = await navigator.mediaDevices.getUserMedia({audio: true, video: false});
         const firstTrack = localStream.getTracks().at(0);
@@ -58,33 +83,12 @@
             pc.addTrack(firstTrack, localStream);
         }
 
-        const offer = await pc.createOffer();
-        const startRes = await post('start', {
-            "request": offer,
-        })
-        const startJson = await startRes.json()
-
-        const answer = startJson['response'];
-        connectionId = startJson['connection_id'];
-
-        await pc.setLocalDescription(offer);
-        await pc.setRemoteDescription(answer);
-
-        while (true) {
-            const candidate = await get(`trickle/${connectionId}`)
-            if (candidate.status === 204) {
-                console.log('no more remote ice-candidates')
-                break
-            }
-            const candidateJson = await candidate.json();
-            console.log('remote ice-candidate', candidateJson)
-            await pc.addIceCandidate(candidateJson.ice_candidate);
-        }
-
         async function onLocalIceCandidateEvent(ev) {
             if (!ev.candidate) {
                 return
             }
+
+            await remoteReachable
 
             const ice_candidate = {
                 "sdpMid": ev.candidate.sdpMid,
@@ -102,7 +106,11 @@
         }
 
         async function onStateChangeEvent() {
-            logState(pc.connectionState + ' ' + pc.signalingState);
+            logState(`${pc.connectionState} ${pc.signalingState}`);
+            if(pc.connectionState === 'disconnected') {
+                console.log('restarting ice negotiation')
+                pc.restartIce();
+            }
         }
 
         async function onTrackEvent(ev) {
@@ -123,13 +131,69 @@
             document.body.appendChild(audioEl)
             audioEl.autoplay = true
             audioEl.srcObject = stream
-            audioEl.play().then(() => onPlaying())
+            audioEl.play().then(() => console.log('now playing'))
+        }
+    }
 
-            // show volume
+    let isNegotiating = false
+    async function onNegotiationNeeded() {
+        if(isNegotiating) {
+            return
         }
 
-        async function onPlaying() {
-            logState('playing')
+        isNegotiating = true
+        console.log('Negotiation needed');
+        if (connectionId) {
+            remoteReachable = waitForRemoteReachable()
+
+            await remoteReachable
+            await updateRemoteDescription()
+            await trickleRemoteCandidates()
+        } else {
+            console.log('Starting new connection')
+            await startConnection()
+            await trickleRemoteCandidates()
+        }
+        isNegotiating = false
+    }
+
+    async function startConnection() {
+        const offer = await pc.createOffer();
+
+        const startRes = await post('start', {
+            "request": offer,
+        })
+        const startJson = await startRes.json()
+
+        connectionId = startJson['connection_id']
+        const answer = startJson['response']
+
+        await pc.setLocalDescription(offer)
+        await pc.setRemoteDescription(answer)
+    }
+
+    async function updateRemoteDescription() {
+        await pc.setLocalDescription()
+        const offer = pc.localDescription
+
+        const updateRes = await post(`update/${connectionId}`, {
+            "request": offer,
+        })
+        const updateJson = await updateRes.json()
+        const answer = updateJson['response']
+        await pc.setRemoteDescription(answer)
+    }
+
+    async function trickleRemoteCandidates() {
+        while (true) {
+            const candidate = await get(`trickle/${connectionId}`)
+            if (candidate.status === 204) {
+                console.log('no more remote ice-candidates')
+                break
+            }
+            const candidateJson = await candidate.json();
+            console.log('remote ice-candidate', candidateJson.ice_candidate)
+            await pc.addIceCandidate(candidateJson.ice_candidate);
         }
     }
 

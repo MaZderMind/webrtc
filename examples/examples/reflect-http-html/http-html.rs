@@ -98,7 +98,9 @@ async fn main() -> io::Result<()> {
                 connections: connections.clone(),
             }))
             .service(index)
+            .service(ping)
             .service(start)
+            .service(update)
             .service(trickle_in)
             .service(trickle_out)
             .service(stop)
@@ -116,6 +118,13 @@ async fn index() -> Result<HttpResponse, Box<dyn std::error::Error>> {
         .expect(format!("Cannot read file at {}, cwd is {}", path, cwd.display()).as_str());
 
     Ok(HttpResponse::Ok().content_type("text/html").body(content))
+}
+
+/// Respond with a known HTTP Code and body. This is used by the client to verify connectivity has been re-established
+/// after a loss of communication, ie. because of a roaming event.
+#[get("/ping")]
+async fn ping() -> Result<HttpResponse, Box<dyn std::error::Error>> {
+    Ok(HttpResponse::Ok().content_type("text/plain").body("pong"))
 }
 
 #[derive(Deserialize)]
@@ -315,6 +324,59 @@ async fn start(
 }
 
 #[derive(Deserialize)]
+struct UpdateRequest {
+    request: RTCSessionDescription,
+}
+#[derive(Serialize)]
+struct UpdateResponse {
+    response: RTCSessionDescription,
+}
+
+#[post("/update/{connection_id}")]
+async fn update(
+    connection_id: web::Path<Uuid>,
+    body: Json<UpdateRequest>,
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, Box<dyn std::error::Error>> {
+    // This code is repeated in all http endpoints but only commented here
+
+    let maybe_connection = {
+        // Lock the connections HashMap for reading
+        let connections = state.connections.read().await;
+        // get the Option<Arc<StoredConnection>> and clone Option & Arc
+        connections.get(connection_id.as_ref()).cloned()
+        // release the read-lock to that parallel start-requests can acquire the write-lock to add new connections
+    };
+
+    match maybe_connection {
+        Some(connection) => {
+            // update the remote-description on the running connection
+            connection
+                .peer_connection
+                .set_remote_description(body.request.to_owned())
+                .await?;
+
+            let answer = connection
+                .peer_connection
+                .create_answer(None)
+                .await?;
+
+            connection
+                .peer_connection
+                .set_local_description(answer.clone())
+                .await?;
+
+            Ok(HttpResponse::Ok().json(UpdateResponse {
+                response: answer,
+            }))
+        }
+        None => {
+            Ok(HttpResponse::NotFound().body(format!("Unknown Connection-Id {}", connection_id)))
+        }
+    }
+}
+
+#[derive(Deserialize)]
 struct TrickleRequest {
     ice_candidate: RTCIceCandidateInit,
 }
@@ -327,14 +389,9 @@ async fn trickle_in(
     state: web::Data<AppState>,
 ) -> Result<HttpResponse, Box<dyn std::error::Error>> {
     info!("Received Trickle Ice Candidate: {:?}", body.ice_candidate);
-    // This code is repeated in all http endpoints but only commented here
-
     let maybe_connection = {
-        // Lock the connections HashMap for reading
         let connections = state.connections.read().await;
-        // get the Option<Arc<StoredConnection>> and clone Option & Arc
         connections.get(connection_id.as_ref()).cloned()
-        // release the read-lock to that parallel start-requests can acquire the write-lock to add new connections
     };
 
     // at this point the Option and the Arc are cloned, which means that we can continue to use both
@@ -375,7 +432,7 @@ async fn trickle_out(
     match maybe_connection {
         Some(connection) => {
             // lock the channels read-end exclusively - this is a mpsc (multi-producer-single-consumer) channel which
-            // gurantees that each message will be delivered exactly once.
+            // guarantees that each message will be delivered exactly once.
             let mut receiver = connection.ice_candidates_channel.lock().await;
 
             // Wait for messages on the channel receiver
@@ -391,9 +448,6 @@ async fn trickle_out(
                 // Successfully received a value from the channel, but it did not contain an ice-candidate
                 // this signals the last candidate has been received and no more will follow
                 Some(None) => {
-                    // close the channel
-                    receiver.close();
-
                     // communicate: no more candidates
                     Ok(HttpResponse::NoContent().finish())
                 }
